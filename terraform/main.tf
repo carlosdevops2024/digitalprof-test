@@ -4,7 +4,6 @@ terraform {
     aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
 
-  # Backend remoto recomendado para no perder el state
   backend "s3" {
     bucket = "flask-devops-tfstate-us-east-1"
     key    = "eks/terraform.tfstate"
@@ -67,7 +66,7 @@ module "eks" {
   access_entries = {
     carlos-role = {
       principal_arn     = "arn:aws:iam::458329143948:role/eks-admin-access-carlos"
-      kubernetes_groups = []  # <-- vació, no uses system:masters
+      kubernetes_groups = []  
 
       policy_associations = {
         admin = {
@@ -79,7 +78,7 @@ module "eks" {
 
     carlos-user = {
       principal_arn     = "arn:aws:iam::458329143948:user/carlos_admin"
-      kubernetes_groups = []  # <-- vació también
+      kubernetes_groups = []  
 
       policy_associations = {
         admin = {

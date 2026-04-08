@@ -1,0 +1,191 @@
+trigger: none
+
+pool:
+  name: carlosPool
+
+variables:
+  - group: flask-devops-secrets
+  - name: AWS_REGION
+    value: us-east-1
+  - name: ECR_REGISTRY
+    value: $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+  - name: IMAGE_NAME
+    value: flask-devops-demo
+  - name: IMAGE_TAG
+    value: $(Build.BuildId)
+  - name: EKS_CLUSTER
+    value: flask-eks-cluster
+
+stages:
+
+# =============================================================
+# STAGE 1 - SONAR ANALYSIS
+# =============================================================
+- stage: CodeQuality
+  displayName: SonarQube Analysis
+  jobs:
+    - job: SonarAnalysis
+      steps:
+        - powershell: |
+            java -version
+            Write-Host "JAVA_HOME=$env:JAVA_HOME"
+          displayName: Validate Java
+
+        - task: SonarCloudPrepare@4
+          inputs:
+            SonarCloud: SonarClous
+            organization: carlos-302090
+            scannerMode: cli
+            configMode: manual
+            cliProjectKey: carlos-302090_digitalprof-test
+            cliProjectName: digitalprof-test
+            cliSources: .
+            extraProperties: |
+              sonar.qualitygate.wait=true
+              sonar.python.version=3
+
+        - script: pip install -r app/requirements.txt
+          displayName: Install dependencies
+
+        - task: SonarCloudAnalyze@4
+          continueOnError: true
+          displayName: Run Sonar
+
+        - task: SonarCloudPublish@4
+          continueOnError: true
+          inputs:
+            pollingTimeoutSec: 300
+          displayName: Publish Quality Gate
+
+# =============================================================
+# STAGE 2 - SONAR RESULT SCENARIOS
+# =============================================================
+- stage: SonarSuccess
+  displayName: Sonar Success Scenario
+  dependsOn: CodeQuality
+  condition: succeededOrFailed()
+  jobs:
+    - job: ShowSonarResult
+      steps:
+        - powershell: |
+            Write-Host "Sonar finalizó. Revisar dashboard para resultado."
+            Write-Host "https://sonarcloud.io/dashboard?id=carlos-302090_digitalprof-test"
+
+# =============================================================
+# STAGE 3 - BUILD + PUSH
+# =============================================================
+- stage: BuildAndPush
+  displayName: Docker Build and ECR Push
+  dependsOn: SonarSuccess
+  condition: succeededOrFailed()
+  jobs:
+    - job: DockerBuild
+      steps:
+        - script: |
+            aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(ECR_REGISTRY)
+          displayName: ECR login
+          env:
+            AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+            AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+            AWS_DEFAULT_REGION: $(AWS_REGION)
+
+        - powershell: |
+            docker build -t $(IMAGE_NAME):$(IMAGE_TAG) .
+            docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(ECR_REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
+            docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(ECR_REGISTRY)/$(IMAGE_NAME):latest
+            docker push $(ECR_REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
+            docker push $(ECR_REGISTRY)/$(IMAGE_NAME):latest
+          displayName: Build and push Docker image
+
+# =============================================================
+# STAGE 4 - PARALLEL JOBS (1 AGENTE REAL)
+# =============================================================
+- stage: ParallelJobs
+  displayName: Parallel Scripts
+  dependsOn: BuildAndPush
+  condition: succeededOrFailed()
+  jobs:
+    - job: ParallelSingleAgent
+      displayName: Run Parallel Tasks in One Agent
+      steps:
+        - powershell: |
+            $job1 = Start-Job {
+              1..10 | ForEach-Object {
+                Write-Output "[$_] Hola Mundo"
+                Start-Sleep 1
+              }
+            }
+
+            $job2 = Start-Job {
+              New-Item -ItemType Directory -Force -Path fecha_files | Out-Null
+              1..10 | ForEach-Object {
+                $file = "fecha_files/archivo_{0:D2}.txt" -f $_
+                $fecha = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                "Archivo $_ - Fecha: $fecha" | Out-File $file
+                Write-Output "Creado: $file"
+                Start-Sleep 1
+              }
+            }
+
+            Wait-Job $job1, $job2
+            Receive-Job $job1
+            Receive-Job $job2
+          displayName: Simulate Parallel Jobs
+
+# =============================================================
+# STAGE 5 - DEPLOY EKS
+# =============================================================
+- stage: DeployEKS
+  displayName: Deploy to EKS
+  dependsOn: ParallelJobs
+  condition: succeededOrFailed()
+  jobs:
+    - deployment: DeployFlask
+      environment: production
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - powershell: |
+                  aws eks update-kubeconfig `
+                    --region $(AWS_REGION) `
+                    --name $(EKS_CLUSTER)
+                displayName: Configure kubectl
+                env:
+                  AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+                  AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+                  AWS_DEFAULT_REGION: $(AWS_REGION)
+ 
+              # FIX: Descarga directa del binario para evitar problemas
+              # de PATH con winget en la sesión actual de PowerShell
+              - powershell: |
+                  if (-not (Get-Command helm -ErrorAction SilentlyContinue)) {
+                    Write-Host "Instalando Helm..."
+                    $helmVersion = "v3.17.3"
+                    $url = "https://get.helm.sh/helm-$helmVersion-windows-amd64.zip"
+                    Invoke-WebRequest -Uri $url -OutFile helm.zip
+                    Expand-Archive helm.zip -DestinationPath helm-bin
+                    Move-Item helm-bin\windows-amd64\helm.exe C:\Windows\System32\helm.exe
+                    Remove-Item helm.zip, helm-bin -Recurse -Force
+                    Write-Host "Helm instalado correctamente."
+                  } else {
+                    Write-Host "Helm ya está instalado."
+                  }
+                  helm version
+                displayName: Install Helm if needed
+ 
+              - powershell: |
+                  helm upgrade --install flask-app ./helm/flask-app `
+                    --namespace flask-app `
+                    --create-namespace `
+                    --set image.repository=$(ECR_REGISTRY)/$(IMAGE_NAME) `
+                    --set image.tag=$(IMAGE_TAG) `
+                    --wait `
+                    --timeout 5m
+                displayName: Helm upgrade/install
+ 
+              - powershell: |
+                  kubectl get pods -n flask-app
+                  kubectl get svc -n flask-app
+                  kubectl get ingress -n flask-app
+                displayName: Verify deployment
